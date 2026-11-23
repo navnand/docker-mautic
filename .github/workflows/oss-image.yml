@@ -1,0 +1,136 @@
+# Branch oss: upstream docker-mautic plus this workflow and oss.Dockerfile.
+# A tag "oss/<mautic image tag>-oss<n>" (for example oss/7.2.2-apache-oss1)
+# builds oss.Dockerfile on mautic/mautic:<mautic image tag> and pushes
+# ghcr.io/<owner>/mautic:<mautic image tag>-oss<n>.
+name: oss image
+
+on:
+  push:
+    branches: [oss]
+    tags: ["oss/*"]
+  pull_request:
+    branches: [oss]
+
+permissions:
+  contents: read
+
+jobs:
+  # Checks the lines and commit messages this branch adds on top of upstream
+  # against the list in the OSS_DENY_LIST secret. Reports file:line only.
+  privacy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Added lines name nothing private
+        env:
+          DENY: ${{ secrets.OSS_DENY_LIST }}
+          ACCEPT: ${{ secrets.OSS_DENY_ACCEPT }}
+        run: |
+          if [ -z "$DENY" ]; then
+            echo "::notice::OSS_DENY_LIST isn't available here: check skipped"; exit 0
+          fi
+          git fetch -q --no-tags https://github.com/mautic/docker-mautic.git "+refs/heads/main:refs/remotes/upstream/main"
+          base=$(git merge-base HEAD upstream/main)
+          t="$RUNNER_TEMP"
+          printf '%s\n' "$DENY" | grep -vE '^\s*(#|$)' > "$t/deny"
+          printf '%s\n' "$ACCEPT" | grep -vE '^\s*(#|$)' > "$t/accept" || true
+          git diff --no-color -U0 "$base" HEAD \
+            | awk '/^\+\+\+ b\//{f=substr($0,7)} /^@@/{split($3,a,/[+,]/); n=a[2]-1} /^\+[^+]/{n++; print f":"n": "substr($0,2)}' > "$t/added"
+          git diff --name-only --diff-filter=ACR "$base" HEAD | sed 's/$/:1: (file name)/' >> "$t/added"
+          git log --format='%h%n%B' "$base"..HEAD | awk 'NF==1 && /^[0-9a-f]{7,}$/{c=$0; next} !/^Co-Authored-By:/{print "commit "c":0: "$0}' >> "$t/added"
+          : > "$t/hits"
+          while IFS= read -r p; do
+            P="$p" perl -ne 'print if /$ENV{P}/' "$t/added" >> "$t/hits"
+          done < "$t/deny"
+          if [ -s "$t/accept" ]; then grep -vF -f "$t/accept" "$t/hits" > "$t/left" || true; else cp "$t/hits" "$t/left"; fi
+          if [ -s "$t/left" ]; then
+            cut -d: -f1,2 "$t/left" | sort -u | while IFS=: read -r f l; do
+              echo "::error file=$f,line=$l::names or points to something private"
+            done
+            exit 1
+          fi
+          echo "checked $(wc -l < "$t/added") added lines since $base"
+
+  # This branch's commits, and the tagger of an oss/* tag, use a GitHub
+  # no-reply address.
+  authors:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Commits use a no-reply address
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          git fetch -q --no-tags https://github.com/mautic/docker-mautic.git "+refs/heads/main:refs/remotes/upstream/main"
+          base=$(git merge-base "$HEAD_SHA" upstream/main)
+          ok='@users\.noreply\.github\.com$'
+          bad=$(git log --format='%h %ae %ce' "$base..$HEAD_SHA" | awk -v ok="$ok" '$2 !~ ok || $3 !~ ok {print $1}')
+          case "$GITHUB_REF" in refs/tags/*)
+            tagger=$(git for-each-ref --format='%(taggeremail:trim)' "$GITHUB_REF")
+            if [ -n "$tagger" ] && ! printf '%s' "$tagger" | grep -qE "$ok"; then bad="$bad ${GITHUB_REF_NAME}"; fi ;;
+          esac
+          if [ -n "$(echo $bad)" ]; then
+            for c in $bad; do echo "::error::$c: author, committer or tagger is not a GitHub no-reply address"; done
+            exit 1
+          fi
+          echo "checked $(git rev-list --count "$base..$HEAD_SHA") commits since $base"
+
+  image:
+    if: startsWith(github.ref, 'refs/tags/oss/')
+    needs: [privacy, authors]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Version
+        id: v
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#oss/}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(apache|fpm)-oss[0-9]+$ ]] || { echo "::error::tag $GITHUB_REF_NAME isn't oss/<x.y.z>-apache|fpm-oss<n>"; exit 1; }
+          echo "mautic=${version%-oss*}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/mautic:$version" >> "$GITHUB_OUTPUT"
+      - name: Log in to the registry
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: Already built?
+        id: have
+        env:
+          IMAGE: ${{ steps.v.outputs.image }}
+        run: |
+          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "$IMAGE exists: nothing to build"; echo "exists=1" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build and push
+        if: steps.have.outputs.exists != '1'
+        env:
+          IMAGE: ${{ steps.v.outputs.image }}
+          MAUTIC: ${{ steps.v.outputs.mautic }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/empty"
+          # No provenance or SBOM attestations.
+          docker build \
+            --platform linux/amd64 \
+            --provenance=false --sbom=false \
+            --build-arg MAUTIC_VERSION="$MAUTIC" \
+            --label org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
+            --label org.opencontainers.image.title=mautic \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --label org.opencontainers.image.licenses=GPL-3.0-or-later \
+            -f oss.Dockerfile \
+            -t "$IMAGE" "$RUNNER_TEMP/empty"
+          docker push "$IMAGE"
