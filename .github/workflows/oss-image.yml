@@ -121,7 +121,9 @@ jobs:
           MAUTIC: ${{ steps.v.outputs.mautic }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/empty"
+          # Build context: only oss-patches/.
+          mkdir -p "$RUNNER_TEMP/context"
+          cp -R oss-patches "$RUNNER_TEMP/context/"
           # No provenance or SBOM attestations.
           docker build \
             --platform linux/amd64 \
@@ -132,5 +134,5 @@ jobs:
             --label org.opencontainers.image.revision="$GITHUB_SHA" \
             --label org.opencontainers.image.licenses=GPL-3.0-or-later \
             -f oss.Dockerfile \
-            -t "$IMAGE" "$RUNNER_TEMP/empty"
+            -t "$IMAGE" "$RUNNER_TEMP/context"
           docker push "$IMAGE"
