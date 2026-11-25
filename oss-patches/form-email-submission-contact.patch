@@ -1,0 +1,19 @@
+The form action that emails the contact looks up the tracked contact of the
+request. When there is none (the visitor sends Do Not Track or Global
+Privacy Control and tracking is blocked for the request), no email is sent.
+This falls back to the contact saved with the submission.
+
+--- a/docroot/app/bundles/EmailBundle/EventListener/FormSubscriber.php
++++ b/docroot/app/bundles/EmailBundle/EventListener/FormSubscriber.php
+@@ -77,6 +77,11 @@
+ 
+         $currentLead = $this->getCurrentLead($event->getActionFeedback());
+ 
++        // Use the submission's contact when the request has no tracked contact with an email.
++        if (empty($currentLead['email']) && ($submitted = $event->getSubmission()->getLead()) instanceof Lead) {
++            $currentLead = $submitted->getProfileFields();
++        }
++
+         if (isset($properties['user_id']) && $properties['user_id']) {
+             $this->emailModel->sendEmailToUser($email, $properties['user_id'], $currentLead, $event->getTokens());
+         } elseif (isset($currentLead['email'])) {
