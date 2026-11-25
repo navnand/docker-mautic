@@ -1,0 +1,27 @@
+Form fields added by plugins (custom fields) need the form builder's field
+settings to render. Pop-ups (focus items) render their form without them, so
+a form with such a field fails with "Variable fieldSettings does not exist".
+This passes the settings through.
+
+diff -ru a/docroot/plugins/MauticFocusBundle/Model/FocusModel.php b/docroot/plugins/MauticFocusBundle/Model/FocusModel.php
+--- a/docroot/plugins/MauticFocusBundle/Model/FocusModel.php
++++ b/docroot/plugins/MauticFocusBundle/Model/FocusModel.php
+@@ -228,6 +228,7 @@
+                 'contactFields'  => $this->leadFieldModel->getFieldListWithProperties(),
+                 'companyFields'  => $this->leadFieldModel->getFieldListWithProperties('company'),
+                 'viewOnlyFields' => $viewOnlyFields,
++                'fieldSettings'  => $this->formModel->getCustomComponents()['fields'],
+                 'displayManager' => $displayManager,
+             ]
+         ) : '';
+diff -ru a/docroot/plugins/MauticFocusBundle/Resources/views/Builder/form.html.twig b/docroot/plugins/MauticFocusBundle/Resources/views/Builder/form.html.twig
+--- a/docroot/plugins/MauticFocusBundle/Resources/views/Builder/form.html.twig
++++ b/docroot/plugins/MauticFocusBundle/Resources/views/Builder/form.html.twig
+@@ -113,6 +113,7 @@
+         'contactFields': contactFields,
+         'companyFields': companyFields,
+         'viewOnlyFields': viewOnlyFields,
++        'fieldSettings': fieldSettings|default([]),
+         'displayManager': displayManager,
+ }, with_context=false) }}
+ <!-- END FOCUS FORM -->
