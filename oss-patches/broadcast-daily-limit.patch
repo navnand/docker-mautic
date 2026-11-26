@@ -1,72 +1,20 @@
-Optional daily limit for segment emails, set with MAUTIC_BROADCAST_DAILY_LIMIT.
-When set, mautic:broadcasts:send sends at most that many segment emails in
-any 24 hours, counted across all segment emails, and the Send button in the
-email list is replaced by a notice, so sending happens only on schedule.
-Unset or 0 keeps the stock behaviour.
+Optional daily limit for segment emails, set in Configuration > Email Settings
+> Segment Email Sending ("Segment emails per day", parameter
+broadcast_daily_limit). When set, mautic:broadcasts:send sends at most that
+many segment emails in any 24 hours, counted across all segment emails, and
+the Send button in the email list is replaced by a notice, so sending happens
+only on schedule. 0 keeps the stock behaviour.
 
---- a/docroot/app/bundles/EmailBundle/EventListener/BroadcastSubscriber.php
-+++ b/docroot/app/bundles/EmailBundle/EventListener/BroadcastSubscriber.php
-@@ -38,6 +38,9 @@
-         // Get list of published broadcasts or broadcast if there is only a single ID
-         $emails = $this->emailRepository->getPublishedBroadcastsIterable($event->getId());
- 
-+        // Segment emails still allowed in the last 24 hours, shared by all emails in this run; null when no limit is set.
-+        $remaining = $this->remainingDailyLimit();
-+
-         foreach ($emails as $email) {
-             // Reset per-email variables from event defaults
-             $maxThreads = $event->getMaxThreads();
-@@ -45,6 +48,14 @@
-             $limit      = $event->getLimit();
-             $batch      = $event->getBatch();
- 
-+            if (null !== $remaining) {
-+                if ($remaining <= 0) {
-+                    $event->getOutput()->writeln('Daily segment email limit reached.');
-+                    break;
-+                }
-+                $limit = null === $limit ? $remaining : min((int) $limit, $remaining);
-+            }
-+
-             $totalPendingCount = null;
- 
-             $emailEntity = $email;
-@@ -90,6 +101,10 @@
-                 $threadId
-             );
- 
-+            if (null !== $remaining) {
-+                $remaining -= $sentCount + $failedCount;
-+            }
-+
-             if ($emailEntity->shouldCheckForUnpublishEmail()) {
-                 $isNotParallelSending = !$event->getThreadId() || 1 === $event->getThreadId();
-                 $totalPendingCount ??= $this->model->getPendingLeads($emailEntity, null, true);
-@@ -111,6 +126,24 @@
-         }
-     }
- 
-+    /**
-+     * Returns MAUTIC_BROADCAST_DAILY_LIMIT minus the segment emails sent in the last 24 hours, or null when the limit is unset.
-+     */
-+    private function remainingDailyLimit(): ?int
-+    {
-+        $cap = (int) getenv('MAUTIC_BROADCAST_DAILY_LIMIT');
-+        if ($cap <= 0) {
-+            return null;
-+        }
-+
-+        $sent = (int) $this->em->getConnection()->fetchOne(
-+            'SELECT COUNT(*) FROM '.MAUTIC_TABLE_PREFIX.'email_stats s INNER JOIN '.MAUTIC_TABLE_PREFIX.'emails e ON e.id = s.email_id WHERE e.email_type = ? AND s.date_sent >= ?',
-+            ['list', (new \DateTime('-24 hours', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s')]
-+        );
-+
-+        return max(0, $cap - $sent);
-+    }
-+
-     private function setStartDateOfABTesting(Email $emailEntity): void
-     {
-         if (!$emailEntity->getVariantSentCount(true)) {
+--- a/docroot/app/bundles/EmailBundle/Config/config.php
++++ b/docroot/app/bundles/EmailBundle/Config/config.php
+@@ -186,6 +186,7 @@
+         'default_signature_text'                                            => null,
+         'email_frequency_number'                                            => 0,
+         'email_frequency_time'                                              => 'DAY',
++        'broadcast_daily_limit'                                             => 0,
+         'show_contact_preferences'                                          => false,
+         'show_contact_frequency'                                            => false,
+         'show_contact_pause_dates'                                          => false,
 --- a/docroot/app/bundles/EmailBundle/Controller/EmailController.php
 +++ b/docroot/app/bundles/EmailBundle/Controller/EmailController.php
 @@ -1478,6 +1478,25 @@
@@ -74,7 +22,7 @@ Unset or 0 keeps the stock behaviour.
          }
  
 +        // With a daily limit set, segment emails are sent only by the scheduled broadcast command.
-+        $dailyLimit = (int) getenv('MAUTIC_BROADCAST_DAILY_LIMIT');
++        $dailyLimit = (int) $this->coreParametersHelper->get('broadcast_daily_limit');
 +        if ($dailyLimit > 0) {
 +            return $this->postActionRedirect(
 +                array_merge(
@@ -95,3 +43,148 @@ Unset or 0 keeps the stock behaviour.
          // Check that the parent is getting sent
          if ($variantParent = $entity->getVariantParent()) {
              return $this->redirectToRoute('mautic_email_action', [
+--- a/docroot/app/bundles/EmailBundle/EventListener/BroadcastSubscriber.php
++++ b/docroot/app/bundles/EmailBundle/EventListener/BroadcastSubscriber.php
+@@ -5,6 +5,7 @@
+ use Doctrine\ORM\EntityManagerInterface;
+ use Mautic\ChannelBundle\ChannelEvents;
+ use Mautic\ChannelBundle\Event\ChannelBroadcastEvent;
++use Mautic\CoreBundle\Helper\CoreParametersHelper;
+ use Mautic\CoreBundle\Helper\DateTimeHelper;
+ use Mautic\EmailBundle\Entity\Email;
+ use Mautic\EmailBundle\Entity\EmailRepository;
+@@ -19,6 +20,7 @@
+         private EntityManagerInterface $em,
+         private TranslatorInterface $translator,
+         private EmailRepository $emailRepository,
++        private CoreParametersHelper $coreParametersHelper,
+     ) {
+     }
+ 
+@@ -38,6 +40,9 @@
+         // Get list of published broadcasts or broadcast if there is only a single ID
+         $emails = $this->emailRepository->getPublishedBroadcastsIterable($event->getId());
+ 
++        // Segment emails still allowed in the last 24 hours, shared by all emails in this run; null when no limit is set.
++        $remaining = $this->remainingDailyLimit();
++
+         foreach ($emails as $email) {
+             // Reset per-email variables from event defaults
+             $maxThreads = $event->getMaxThreads();
+@@ -45,6 +50,14 @@
+             $limit      = $event->getLimit();
+             $batch      = $event->getBatch();
+ 
++            if (null !== $remaining) {
++                if ($remaining <= 0) {
++                    $event->getOutput()->writeln('Daily segment email limit reached.');
++                    break;
++                }
++                $limit = null === $limit ? $remaining : min((int) $limit, $remaining);
++            }
++
+             $totalPendingCount = null;
+ 
+             $emailEntity = $email;
+@@ -90,6 +103,10 @@
+                 $threadId
+             );
+ 
++            if (null !== $remaining) {
++                $remaining -= $sentCount + $failedCount;
++            }
++
+             if ($emailEntity->shouldCheckForUnpublishEmail()) {
+                 $isNotParallelSending = !$event->getThreadId() || 1 === $event->getThreadId();
+                 $totalPendingCount ??= $this->model->getPendingLeads($emailEntity, null, true);
+@@ -109,6 +126,24 @@
+             );
+             $this->em->detach($emailEntity);
+         }
++    }
++
++    /**
++     * Returns MAUTIC_BROADCAST_DAILY_LIMIT minus the segment emails sent in the last 24 hours, or null when the limit is unset.
++     */
++    private function remainingDailyLimit(): ?int
++    {
++        $cap = (int) $this->coreParametersHelper->get('broadcast_daily_limit');
++        if ($cap <= 0) {
++            return null;
++        }
++
++        $sent = (int) $this->em->getConnection()->fetchOne(
++            'SELECT COUNT(*) FROM '.MAUTIC_TABLE_PREFIX.'email_stats s INNER JOIN '.MAUTIC_TABLE_PREFIX.'emails e ON e.id = s.email_id WHERE e.email_type = ? AND s.date_sent >= ?',
++            ['list', (new \DateTime('-24 hours', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s')]
++        );
++
++        return max(0, $cap - $sent);
+     }
+ 
+     private function setStartDateOfABTesting(Email $emailEntity): void
+--- a/docroot/app/bundles/EmailBundle/Form/Type/ConfigType.php
++++ b/docroot/app/bundles/EmailBundle/Form/Type/ConfigType.php
+@@ -19,6 +19,7 @@
+ use Symfony\Component\Form\FormBuilderInterface;
+ use Symfony\Component\Validator\Constraints\Email;
+ use Symfony\Component\Validator\Constraints\NotBlank;
++use Symfony\Component\Validator\Constraints\PositiveOrZero;
+ use Symfony\Contracts\Translation\TranslatorInterface;
+ 
+ /**
+@@ -495,6 +496,22 @@
+                 'multiple'   => false,
+                 'attr'       => [
+                     'class' => 'form-control frequency',
++                ],
++            ]
++        );
++        $builder->add(
++            'broadcast_daily_limit',
++            NumberType::class,
++            [
++                'scale'       => 0,
++                'label'       => 'mautic.email.config.broadcast_daily_limit',
++                'label_attr'  => ['class' => 'control-label'],
++                'required'    => false,
++                'empty_data'  => '0',
++                'constraints' => [new PositiveOrZero()],
++                'attr'        => [
++                    'class'   => 'form-control',
++                    'tooltip' => 'mautic.email.config.broadcast_daily_limit.tooltip',
+                 ],
+             ]
+         );
+--- a/docroot/app/bundles/EmailBundle/Resources/views/FormTheme/Config/_config_emailconfig_widget.html.twig
++++ b/docroot/app/bundles/EmailBundle/Resources/views/FormTheme/Config/_config_emailconfig_widget.html.twig
+@@ -61,6 +61,20 @@
+     </div>
+ </div>
+ 
++{% if fields.broadcast_daily_limit is defined %}
++<h4 class="fw-sb mt-48 mb-xs">{{ 'mautic.email.config.header.broadcast'|trans }}</h4>
++<div class="text-muted small pb-md">{{ 'mautic.email.config.header.broadcast.description'|trans }}</div>
++<div class="row">
++    <div class="panel panel-default mb-md">
++        <div class="panel-body">
++            <div class="col-xs-12">
++                {{ form_row(fields.broadcast_daily_limit) }}
++            </div>
++        </div>
++    </div>
++</div>
++{% endif %}
++
+ {% if fields.monitored_email is defined %}
+     <h4 class="fw-sb mt-48 mb-xs">{{ 'mautic.email.config.header.monitored_email'|trans }}</h4>
+     <div class="text-muted small pb-md">{{ 'mautic.core.config.header.monitored_email.description'|trans }}</div>
+--- a/docroot/app/bundles/EmailBundle/Translations/en_US/messages.ini
++++ b/docroot/app/bundles/EmailBundle/Translations/en_US/messages.ini
+@@ -556,3 +556,7 @@
+ mautic.email.email.searchcommand.ispending="is:pending"
+ mautic.project.email = "Emails"
+ mautic.email.preview.iframe_title="Email preview frame"
++mautic.email.config.broadcast_daily_limit="Segment emails per day"
++mautic.email.config.broadcast_daily_limit.tooltip="Most segment emails sent in any 24 hours, counted across all segment emails. When set, segment emails go out on schedule every hour and the Send button is turned off. Leave at 0 for no limit."
++mautic.email.config.header.broadcast="Segment Email Sending"
++mautic.email.config.header.broadcast.description="Limit how many segment emails go out each day, for example while a new sending domain builds its reputation."
