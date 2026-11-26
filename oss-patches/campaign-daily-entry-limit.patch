@@ -1,35 +1,25 @@
-Optional daily limit on new contacts for chosen campaigns, set in Configuration
-> Campaign Settings > Daily Limit for New Contacts ("Limited campaigns" and
-"New contacts per campaign per day", parameters campaign_daily_entry_campaigns
-and campaign_daily_entry_limit). Campaigns in the campaign category with alias
-"daily-limit" are limited too. mautic:campaigns:update adds at most that many
-contacts from a limited campaign's segments in any 24 hours; the rest stay in
-the segment and join on later runs. Contacts already in the campaign carry on
-as scheduled, and contacts added to a campaign directly are not limited. A
-limit of 0 keeps the stock behaviour.
+Optional daily limit on new contacts for campaigns in the campaign category
+with alias "daily-limit", set in Configuration > Campaign Settings > Daily
+Limit for New Contacts ("New contacts per campaign per day", parameter
+campaign_daily_entry_limit). mautic:campaigns:update adds at most that many
+contacts from such a campaign's segments in any 24 hours; the rest stay in the
+segment and join on later runs. Contacts already in the campaign carry on as
+scheduled, and contacts added to a campaign directly are not limited. A limit
+of 0 keeps the stock behaviour.
 
 --- a/docroot/app/bundles/CampaignBundle/Config/config.php
 +++ b/docroot/app/bundles/CampaignBundle/Config/config.php
-@@ -161,6 +161,8 @@
+@@ -161,6 +161,7 @@
          'campaign_time_wait_on_event_false'                                                     => 'PT1H',
          'campaign_use_summary'                                                                  => 0,
          'campaign_by_range'                                                                     => 0,
 +        'campaign_daily_entry_limit'                                                            => 0,
-+        'campaign_daily_entry_campaigns'                                                        => [],
          'delete_campaign_event_log_in_background'                                               => false,
          'campaign_email_stats_enabled'                                                          => true,
          'peak_interaction_timer_cache_timeout'                                                  => Mautic\LeadBundle\Services\PeakInteractionTimer::DEFAULT_CACHE_TIMEOUT,
 --- a/docroot/app/bundles/CampaignBundle/Form/Type/ConfigType.php
 +++ b/docroot/app/bundles/CampaignBundle/Form/Type/ConfigType.php
-@@ -2,6 +2,7 @@
- 
- namespace Mautic\CampaignBundle\Form\Type;
- 
-+use Mautic\CampaignBundle\Entity\CampaignRepository;
- use Mautic\CoreBundle\Form\Type\YesNoButtonGroupType;
- use Symfony\Component\Form\AbstractType;
- use Symfony\Component\Form\Extension\Core\Type\ChoiceType;
-@@ -9,6 +10,7 @@
+@@ -9,6 +9,7 @@
  use Symfony\Component\Form\FormBuilderInterface;
  use Symfony\Component\Validator\Constraints\Callback;
  use Symfony\Component\Validator\Constraints\GreaterThanOrEqual;
@@ -37,42 +27,10 @@ limit of 0 keeps the stock behaviour.
  use Symfony\Component\Validator\Constraints\Range;
  use Symfony\Component\Validator\Context\ExecutionContextInterface;
  use Symfony\Contracts\Translation\TranslatorInterface;
-@@ -20,6 +22,7 @@
- {
-     public function __construct(
-         private readonly TranslatorInterface $translator,
-+        private readonly CampaignRepository $campaignRepository,
-     ) {
-     }
- 
-@@ -83,6 +86,48 @@
+@@ -83,6 +84,24 @@
                      'tooltip' => 'mautic.campaignconfig.use_summary.tooltip',
                  ],
                  'data'  => (bool) ($options['data']['campaign_use_summary'] ?? false),
-+            ]
-+        );
-+
-+        $campaignChoices = [];
-+        foreach ($this->campaignRepository->findBy([], ['name' => 'ASC']) as $campaign) {
-+            if (!$campaign->isDeleted()) {
-+                $campaignChoices[$campaign->getName().' ('.$campaign->getId().')'] = $campaign->getId();
-+            }
-+        }
-+
-+        $builder->add(
-+            'campaign_daily_entry_campaigns',
-+            ChoiceType::class,
-+            [
-+                'label'      => 'mautic.campaignconfig.campaign_daily_entry_campaigns',
-+                'label_attr' => ['class' => 'control-label'],
-+                'choices'    => $campaignChoices,
-+                'multiple'   => true,
-+                'required'   => false,
-+                'data'       => array_map('intval', (array) ($options['data']['campaign_daily_entry_campaigns'] ?? [])),
-+                'attr'       => [
-+                    'class'   => 'form-control',
-+                    'tooltip' => 'mautic.campaignconfig.campaign_daily_entry_campaigns.tooltip',
-+                ],
 +            ]
 +        );
 +
@@ -169,24 +127,20 @@ limit of 0 keeps the stock behaviour.
          return $contactsProcessed;
      }
  
-@@ -187,6 +214,29 @@
+@@ -187,6 +214,25 @@
          $this->finishProgressBar();
  
          return $contactsProcessed;
 +    }
 +
 +    /**
-+     * Returns how many more contacts a campaign with a daily limit may take in the last 24 hours, or null without one.
-+     * A campaign has the limit when it is chosen in the configuration or is in the campaign category with alias "daily-limit".
++     * Returns how many more contacts a campaign in the category with alias "daily-limit" may take in the last 24 hours, or null for other campaigns.
 +     */
 +    private function remainingDailyEntries(): ?int
 +    {
-+        $limit     = (int) $this->coreParametersHelper->get('campaign_daily_entry_limit');
-+        $campaigns = array_map('intval', (array) $this->coreParametersHelper->get('campaign_daily_entry_campaigns', []));
-+        $category  = $this->campaign->getCategory();
-+        $limited   = in_array((int) $this->campaign->getId(), $campaigns, true)
-+            || ($category && 'daily-limit' === $category->getAlias());
-+        if ($limit <= 0 || !$limited) {
++        $limit    = (int) $this->coreParametersHelper->get('campaign_daily_entry_limit');
++        $category = $this->campaign->getCategory();
++        if ($limit <= 0 || !$category || 'daily-limit' !== $category->getAlias()) {
 +            return null;
 +        }
 +
@@ -201,7 +155,7 @@ limit of 0 keeps the stock behaviour.
      private function startProgressBar(int $total): void
 --- a/docroot/app/bundles/CampaignBundle/Resources/views/FormTheme/Config/_config_campaignconfig_widget.html.twig
 +++ b/docroot/app/bundles/CampaignBundle/Resources/views/FormTheme/Config/_config_campaignconfig_widget.html.twig
-@@ -19,6 +19,23 @@
+@@ -19,6 +19,22 @@
      </div>
  </div>
  
@@ -213,7 +167,6 @@ limit of 0 keeps the stock behaviour.
 +        <div class="panel-body">
 +            <div class="row">
 +                <div class="col-xs-12">
-+                    {{ formRowIfExists(form, 'campaign_daily_entry_campaigns') }}
 +                    {{ formRowIfExists(form, 'campaign_daily_entry_limit') }}
 +                </div>
 +            </div>
@@ -227,13 +180,11 @@ limit of 0 keeps the stock behaviour.
  <div class="row">
 --- a/docroot/app/bundles/CampaignBundle/Translations/en_US/messages.ini
 +++ b/docroot/app/bundles/CampaignBundle/Translations/en_US/messages.ini
-@@ -347,3 +347,9 @@
+@@ -347,3 +347,7 @@
  mautic.campaign.event.delete.do_not_redirect="Do not Redirect"
  mautic.campaign.event.delete.redirect_event="Redirect Event"
  mautic.campaign.event.id="ID"
 +mautic.campaignconfig.header.daily_entry="Daily Limit for New Contacts"
-+mautic.campaignconfig.header.daily_entry.description="Let the chosen campaigns, and campaigns in the \"Daily limit\" category, take only so many new contacts from their segments in any 24 hours. Contacts already in a campaign carry on as scheduled."
-+mautic.campaignconfig.campaign_daily_entry_campaigns="Limited campaigns"
-+mautic.campaignconfig.campaign_daily_entry_campaigns.tooltip="Campaigns that take new contacts from their segments at the daily limit below. Campaigns in the \"Daily limit\" category are limited too; other campaigns are not."
++mautic.campaignconfig.header.daily_entry.description="Campaigns in the \"Daily limit\" category take only so many new contacts from their segments in any 24 hours; the rest join on later days. Contacts already in a campaign carry on as scheduled."
 +mautic.campaignconfig.campaign_daily_entry_limit="New contacts per campaign per day"
 +mautic.campaignconfig.campaign_daily_entry_limit.tooltip="Most contacts each limited campaign takes from its segments in any 24 hours. The rest wait in the segment and join on later days. 0 means no limit."
