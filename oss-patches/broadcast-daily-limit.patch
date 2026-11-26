@@ -1,0 +1,97 @@
+Optional daily limit for segment emails, set with MAUTIC_BROADCAST_DAILY_LIMIT.
+When set, mautic:broadcasts:send sends at most that many segment emails in
+any 24 hours, counted across all segment emails, and the Send button in the
+email list is replaced by a notice, so sending happens only on schedule.
+Unset or 0 keeps the stock behaviour.
+
+--- a/docroot/app/bundles/EmailBundle/EventListener/BroadcastSubscriber.php
++++ b/docroot/app/bundles/EmailBundle/EventListener/BroadcastSubscriber.php
+@@ -38,6 +38,9 @@
+         // Get list of published broadcasts or broadcast if there is only a single ID
+         $emails = $this->emailRepository->getPublishedBroadcastsIterable($event->getId());
+ 
++        // Segment emails still allowed in the last 24 hours, shared by all emails in this run; null when no limit is set.
++        $remaining = $this->remainingDailyLimit();
++
+         foreach ($emails as $email) {
+             // Reset per-email variables from event defaults
+             $maxThreads = $event->getMaxThreads();
+@@ -45,6 +48,14 @@
+             $limit      = $event->getLimit();
+             $batch      = $event->getBatch();
+ 
++            if (null !== $remaining) {
++                if ($remaining <= 0) {
++                    $event->getOutput()->writeln('Daily segment email limit reached.');
++                    break;
++                }
++                $limit = null === $limit ? $remaining : min((int) $limit, $remaining);
++            }
++
+             $totalPendingCount = null;
+ 
+             $emailEntity = $email;
+@@ -90,6 +101,10 @@
+                 $threadId
+             );
+ 
++            if (null !== $remaining) {
++                $remaining -= $sentCount + $failedCount;
++            }
++
+             if ($emailEntity->shouldCheckForUnpublishEmail()) {
+                 $isNotParallelSending = !$event->getThreadId() || 1 === $event->getThreadId();
+                 $totalPendingCount ??= $this->model->getPendingLeads($emailEntity, null, true);
+@@ -111,6 +126,24 @@
+         }
+     }
+ 
++    /**
++     * Returns MAUTIC_BROADCAST_DAILY_LIMIT minus the segment emails sent in the last 24 hours, or null when the limit is unset.
++     */
++    private function remainingDailyLimit(): ?int
++    {
++        $cap = (int) getenv('MAUTIC_BROADCAST_DAILY_LIMIT');
++        if ($cap <= 0) {
++            return null;
++        }
++
++        $sent = (int) $this->em->getConnection()->fetchOne(
++            'SELECT COUNT(*) FROM '.MAUTIC_TABLE_PREFIX.'email_stats s INNER JOIN '.MAUTIC_TABLE_PREFIX.'emails e ON e.id = s.email_id WHERE e.email_type = ? AND s.date_sent >= ?',
++            ['list', (new \DateTime('-24 hours', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s')]
++        );
++
++        return max(0, $cap - $sent);
++    }
++
+     private function setStartDateOfABTesting(Email $emailEntity): void
+     {
+         if (!$emailEntity->getVariantSentCount(true)) {
+--- a/docroot/app/bundles/EmailBundle/Controller/EmailController.php
++++ b/docroot/app/bundles/EmailBundle/Controller/EmailController.php
+@@ -1478,6 +1478,25 @@
+             $this->throwAccessDenied();
+         }
+ 
++        // With a daily limit set, segment emails are sent only by the scheduled broadcast command.
++        $dailyLimit = (int) getenv('MAUTIC_BROADCAST_DAILY_LIMIT');
++        if ($dailyLimit > 0) {
++            return $this->postActionRedirect(
++                array_merge(
++                    $postActionVars,
++                    [
++                        'flashes' => [
++                            [
++                                'type'    => 'notice',
++                                'msg'     => 'Segment emails are sent on schedule, up to %limit% a day. Set the email\'s publish date to start sending.',
++                                'msgVars' => ['%limit%' => $dailyLimit],
++                            ],
++                        ],
++                    ]
++                )
++            );
++        }
++
+         // Check that the parent is getting sent
+         if ($variantParent = $entity->getVariantParent()) {
+             return $this->redirectToRoute('mautic_email_action', [

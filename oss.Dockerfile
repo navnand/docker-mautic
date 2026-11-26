@@ -3,7 +3,8 @@
 # bounce and complaint notifications at /mailer/callback. Adds the captcha
 # plugin (firemultimedia/mautic-multi-captcha-bundle): Turnstile, hCaptcha and
 # reCAPTCHA form fields checked on submit. Applies oss-patches/*.patch to
-# Mautic's own code (see each patch). Removes node_modules:
+# Mautic's own code (see each patch) and adds the hourly segment email send
+# to the cron jobs. Removes node_modules:
 # the built JavaScript and CSS are already in docroot/media, and only
 # mautic:assets:generate reads node_modules.
 ARG MAUTIC_VERSION
@@ -19,3 +20,5 @@ RUN COMPOSER_ALLOW_SUPERUSER=1 composer require --no-interaction --no-scripts --
 COPY oss-patches/ /tmp/oss-patches/
 RUN for p in /tmp/oss-patches/*.patch; do patch -p1 --forward < "$p" || exit 1; done \
  && rm -rf /tmp/oss-patches var/cache/*
+# Sends scheduled segment emails every hour.
+RUN printf '\n# Segment emails - every hour at 30 past\n30 * * * * php /var/www/html/bin/console mautic:broadcasts:send 2>&1 | tee /tmp/stdout\n' >> /templates/mautic_cron
