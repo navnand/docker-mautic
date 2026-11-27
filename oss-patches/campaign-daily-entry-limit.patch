@@ -1,11 +1,13 @@
 Optional daily limit on new contacts for campaigns in the campaign category
 with alias "daily-limit", set in Configuration > Campaign Settings > Daily
-Limit for New Contacts ("New contacts per campaign per day", parameter
-campaign_daily_entry_limit). mautic:campaigns:update adds at most that many
-contacts from such a campaign's segments in any 24 hours; the rest stay in the
-segment and join on later runs. Contacts already in the campaign carry on as
-scheduled, and contacts added to a campaign directly are not limited. A limit
-of 0 keeps the stock behaviour.
+Limit for New Contacts ("New contacts per campaign per sending day", parameter
+campaign_daily_entry_limit). mautic:campaigns:update takes new contacts from
+such a campaign's segments only when its first email can go: on a day, and
+before the end of the hours, set on that step (in the default time zone). It
+takes at most the limit a day, less those already due the first email on the
+send day. The rest stay in the segment and join on later runs. Contacts
+already in the campaign carry on as scheduled, and contacts added to a
+campaign directly are not limited. A limit of 0 keeps the stock behaviour.
 
 --- a/docroot/app/bundles/CampaignBundle/Config/config.php
 +++ b/docroot/app/bundles/CampaignBundle/Config/config.php
@@ -27,14 +29,10 @@ of 0 keeps the stock behaviour.
  use Symfony\Component\Validator\Constraints\Range;
  use Symfony\Component\Validator\Context\ExecutionContextInterface;
  use Symfony\Contracts\Translation\TranslatorInterface;
-@@ -83,6 +84,24 @@
-                     'tooltip' => 'mautic.campaignconfig.use_summary.tooltip',
-                 ],
-                 'data'  => (bool) ($options['data']['campaign_use_summary'] ?? false),
-+            ]
-+        );
-+
-+        $builder->add(
+@@ -87,6 +88,24 @@
+         );
+ 
+         $builder->add(
 +            'campaign_daily_entry_limit',
 +            NumberType::class,
 +            [
@@ -49,25 +47,32 @@ of 0 keeps the stock behaviour.
 +                    'class'   => 'form-control',
 +                    'tooltip' => 'mautic.campaignconfig.campaign_daily_entry_limit.tooltip',
 +                ],
-             ]
-         );
- 
++            ]
++        );
++
++        $builder->add(
+             'campaign_email_stats_enabled',
+             YesNoButtonGroupType::class,
+             [
 --- a/docroot/app/bundles/CampaignBundle/Membership/MembershipBuilder.php
 +++ b/docroot/app/bundles/CampaignBundle/Membership/MembershipBuilder.php
-@@ -2,10 +2,12 @@
+@@ -2,10 +2,15 @@
  
  namespace Mautic\CampaignBundle\Membership;
  
++use Doctrine\DBAL\ArrayParameterType;
 +use Doctrine\DBAL\Connection;
  use Mautic\CampaignBundle\Entity\Campaign;
++use Mautic\CampaignBundle\Entity\Event;
  use Mautic\CampaignBundle\Entity\LeadRepository as CampaignLeadRepository;
  use Mautic\CampaignBundle\Executioner\ContactFinder\Limiter\ContactLimiter;
  use Mautic\CampaignBundle\Membership\Exception\RunLimitReachedException;
 +use Mautic\CoreBundle\Helper\CoreParametersHelper;
++use Mautic\CoreBundle\Helper\DateTimeHelper;
  use Mautic\CoreBundle\Helper\ProgressBarHelper;
  use Mautic\LeadBundle\Entity\LeadRepository;
  use Symfony\Component\Console\Output\OutputInterface;
-@@ -28,6 +30,8 @@
+@@ -28,6 +33,8 @@
          private readonly CampaignLeadRepository $campaignLeadRepository,
          private readonly LeadRepository $leadRepository,
          private readonly TranslatorInterface $translator,
@@ -76,14 +81,14 @@ of 0 keeps the stock behaviour.
      ) {
      }
  
-@@ -69,6 +73,14 @@
+@@ -69,6 +76,14 @@
      {
          $contactsProcessed = 0;
  
-+        // New contacts this campaign may still take in the last 24 hours; null when it has no daily limit.
++        // New contacts this campaign may take now; null when it has no daily limit.
 +        $remaining = $this->remainingDailyEntries();
 +        if (null !== $remaining && $remaining <= 0) {
-+            $this->output?->writeln('Daily limit for new contacts in this campaign reached.');
++            $this->output?->writeln('Daily limit: this campaign takes no new contacts now.');
 +
 +            return 0;
 +        }
@@ -91,7 +96,7 @@ of 0 keeps the stock behaviour.
          if ($this->output) {
              $countResult = $this->campaignLeadRepository->getCountsForCampaignContactsBySegment(
                  $this->campaign->getId(),
-@@ -98,6 +110,10 @@
+@@ -98,6 +113,10 @@
          );
  
          while (count($contacts)) {
@@ -102,7 +107,7 @@ of 0 keeps the stock behaviour.
              // get an array of contact entities based on the contact id
              $contactCollection = $this->leadRepository->getContactCollection($contacts);
              if ($contactCollection->count() <= 0) {
-@@ -120,6 +136,13 @@
+@@ -120,6 +139,13 @@
                  throw new RunLimitReachedException($contactsProcessed + $totalContactsProcessed);
              }
  
@@ -116,7 +121,7 @@ of 0 keeps the stock behaviour.
              // Get next batch
              $contacts = $this->campaignLeadRepository->getCampaignContactsBySegments(
                  $this->campaign->getId(),
-@@ -130,6 +153,10 @@
+@@ -130,6 +156,10 @@
  
          $this->finishProgressBar();
  
@@ -127,14 +132,13 @@ of 0 keeps the stock behaviour.
          return $contactsProcessed;
      }
  
-@@ -187,6 +214,25 @@
-         $this->finishProgressBar();
- 
+@@ -189,6 +219,133 @@
          return $contactsProcessed;
-+    }
-+
+     }
+ 
 +    /**
-+     * Returns how many more contacts a campaign in the category with alias "daily-limit" may take in the last 24 hours, or null for other campaigns.
++     * Returns how many contacts a campaign in the category with alias "daily-limit" may take now, or null for other campaigns.
++     * It is 0 when the first email cannot go on the day, or before the end of the hours, a new contact would get it.
 +     */
 +    private function remainingDailyEntries(): ?int
 +    {
@@ -144,15 +148,124 @@ of 0 keeps the stock behaviour.
 +            return null;
 +        }
 +
-+        $added = (int) $this->connection->fetchOne(
-+            'SELECT COUNT(*) FROM '.MAUTIC_TABLE_PREFIX.'campaign_leads WHERE campaign_id = ? AND date_added >= ?',
-+            [$this->campaign->getId(), (new \DateTime('-24 hours', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s')]
-+        );
++        // Days and hours are read in the default time zone.
++        $now         = new \DateTime('now', new \DateTimeZone($this->coreParametersHelper->getDefaultTimezone()));
++        $firstEmails = $this->findFirstEmails($this->campaign->getRootEvents(), $now);
++        $sendAt      = null;
++        $emailIds    = [];
++        foreach ($firstEmails as [$event, $runAt]) {
++            $emailIds[] = (int) $event->getId();
++            if ($this->canRunAt($event, $runAt) && (null === $sendAt || $runAt < $sendAt)) {
++                $sendAt = $runAt;
++            }
++        }
 +
-+        return max(0, $limit - $added);
-     }
- 
++        if ($emailIds && null === $sendAt) {
++            return 0;
++        }
++
++        // The larger of: contacts added today, and contacts due a first email on the send day.
++        $used = (int) $this->connection->fetchOne(
++            'SELECT COUNT(*) FROM '.MAUTIC_TABLE_PREFIX.'campaign_leads WHERE campaign_id = ? AND date_added >= ?',
++            [$this->campaign->getId(), $this->toUtc((clone $now)->setTime(0, 0))]
++        );
++        if ($emailIds) {
++            $used = max($used, $this->countDueFirstEmail($emailIds, $sendAt, $now));
++        }
++
++        return max(0, $limit - $used);
++    }
++
++    /**
++     * Returns the first email step on each path, with the time a contact joining now reaches it after the waits.
++     *
++     * @param iterable<Event> $events
++     *
++     * @return array<array{Event, \DateTime}>
++     */
++    private function findFirstEmails(iterable $events, \DateTime $from): array
++    {
++        $found = [];
++        foreach ($events as $event) {
++            if ($event->getDeleted()) {
++                continue;
++            }
++
++            $runAt = clone $from;
++            if (Event::TRIGGER_MODE_INTERVAL === $event->getTriggerMode() && $event->getTriggerInterval()) {
++                $runAt->add((new DateTimeHelper())->buildInterval($event->getTriggerInterval(), $event->getTriggerIntervalUnit()));
++            } elseif (Event::TRIGGER_MODE_DATE === $event->getTriggerMode() && $event->getTriggerDate() > $runAt) {
++                $runAt = \DateTime::createFromInterface($event->getTriggerDate())->setTimezone($from->getTimezone());
++            }
++
++            if ('email.send' === $event->getType()) {
++                $found[] = [$event, $runAt];
++            } elseif (Event::TYPE_DECISION !== $event->getEventType()) {
++                $found = array_merge($found, $this->findFirstEmails($event->getChildren(), $runAt));
++            }
++        }
++
++        return $found;
++    }
++
++    /**
++     * Whether the step's days and hours let it run on the given day, at or after the given time.
++     */
++    private function canRunAt(Event $event, \DateTime $runAt): bool
++    {
++        if (Event::TRIGGER_MODE_DATE === $event->getTriggerMode()) {
++            return true;
++        }
++
++        $days = array_map('intval', $event->getTriggerRestrictedDaysOfWeek());
++        if ($days && !in_array((int) $runAt->format('w'), $days, true)) {
++            return false;
++        }
++
++        $start = $event->getTriggerRestrictedStartHour();
++        $stop  = $event->getTriggerRestrictedStopHour();
++
++        return $event->getTriggerHour() || !$start || !$stop || $runAt->format('H:i') < max($start->format('H:i'), $stop->format('H:i'));
++    }
++
++    /**
++     * Counts contacts sent a first email, due one or not yet started, for the day of the send time.
++     *
++     * @param int[] $emailIds
++     */
++    private function countDueFirstEmail(array $emailIds, \DateTime $sendAt, \DateTime $now): int
++    {
++        $dayStart = (clone $sendAt)->setTime(0, 0);
++        $dayEnd   = (clone $dayStart)->modify('+1 day');
++        $log      = MAUTIC_TABLE_PREFIX.'campaign_lead_event_log';
++
++        return (int) $this->connection->executeQuery(
++            'SELECT COUNT(DISTINCT cl.lead_id) FROM '.MAUTIC_TABLE_PREFIX.'campaign_leads cl'
++            .' LEFT JOIN '.$log.' l ON l.campaign_id = cl.campaign_id AND l.lead_id = cl.lead_id AND l.event_id IN (:events)'
++            .' WHERE cl.campaign_id = :campaign AND ('
++            .' (l.is_scheduled = 0 AND l.date_triggered >= :dayStart AND l.date_triggered < :dayEnd)'
++            .' OR (cl.manually_removed = 0 AND l.is_scheduled = 1 AND l.trigger_date < :dayEnd AND (l.trigger_date >= :dayStart OR l.trigger_date <= :now))'
++            .' OR (cl.manually_removed = 0 AND NOT EXISTS (SELECT 1 FROM '.$log.' a WHERE a.campaign_id = cl.campaign_id AND a.lead_id = cl.lead_id))'
++            .' )',
++            [
++                'events'   => $emailIds,
++                'campaign' => $this->campaign->getId(),
++                'dayStart' => $this->toUtc($dayStart),
++                'dayEnd'   => $this->toUtc($dayEnd),
++                'now'      => $this->toUtc($now),
++            ],
++            ['events' => ArrayParameterType::INTEGER]
++        )->fetchOne();
++    }
++
++    private function toUtc(\DateTime $date): string
++    {
++        return (clone $date)->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s');
++    }
++
      private function startProgressBar(int $total): void
+     {
+         if (!$this->output) {
 --- a/docroot/app/bundles/CampaignBundle/Resources/views/FormTheme/Config/_config_campaignconfig_widget.html.twig
 +++ b/docroot/app/bundles/CampaignBundle/Resources/views/FormTheme/Config/_config_campaignconfig_widget.html.twig
 @@ -19,6 +19,22 @@
@@ -185,6 +298,6 @@ of 0 keeps the stock behaviour.
  mautic.campaign.event.delete.redirect_event="Redirect Event"
  mautic.campaign.event.id="ID"
 +mautic.campaignconfig.header.daily_entry="Daily Limit for New Contacts"
-+mautic.campaignconfig.header.daily_entry.description="Campaigns in the \"Daily limit\" category take only so many new contacts from their segments in any 24 hours; the rest join on later days. Contacts already in a campaign carry on as scheduled."
-+mautic.campaignconfig.campaign_daily_entry_limit="New contacts per campaign per day"
-+mautic.campaignconfig.campaign_daily_entry_limit.tooltip="Most contacts each limited campaign takes from its segments in any 24 hours. The rest wait in the segment and join on later days. 0 means no limit."
++mautic.campaignconfig.header.daily_entry.description="Campaigns in the \"Daily limit\" category take new contacts from their segments only on days their first email can go, before its hours end, and no more than the limit a day. The rest join later. Contacts already in a campaign carry on as scheduled."
++mautic.campaignconfig.campaign_daily_entry_limit="New contacts per campaign per sending day"
++mautic.campaignconfig.campaign_daily_entry_limit.tooltip="Most contacts due each limited campaign's first email on one day. Set that email's days and hours in the campaign. 0 means no limit."
