@@ -4,13 +4,19 @@
 # plugin (firemultimedia/mautic-multi-captcha-bundle): Turnstile, hCaptcha and
 # reCAPTCHA form fields checked on submit. Applies oss-patches/*.patch to
 # Mautic's own code (see each patch) and adds the hourly segment email send
-# to the cron jobs. Removes node_modules:
+# to the cron jobs. Installs the PECL timezonedb extension, which replaces
+# PHP's built-in time zone data for the CLI and Apache and loads before the
+# other extensions. Removes node_modules:
 # the built JavaScript and CSS are already in docroot/media, and only
 # mautic:assets:generate reads node_modules.
 ARG MAUTIC_VERSION
 FROM mautic/mautic:${MAUTIC_VERSION}
 ARG AMAZON_SES_PLUGIN_VERSION=1.0.45
 ARG MULTI_CAPTCHA_PLUGIN_VERSION=1.0.9
+ARG TIMEZONEDB_VERSION=2026.6
+RUN pecl install "timezonedb-${TIMEZONEDB_VERSION}" \
+ && docker-php-ext-enable --ini-name 0-timezonedb.ini timezonedb \
+ && rm -rf /tmp/pear
 WORKDIR /var/www/html
 RUN COMPOSER_ALLOW_SUPERUSER=1 composer require --no-interaction --no-scripts --update-no-dev \
       "etailors/mautic-amazon-ses:${AMAZON_SES_PLUGIN_VERSION}" \

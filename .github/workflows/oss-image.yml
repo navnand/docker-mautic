@@ -1,7 +1,9 @@
 # Branch oss: upstream docker-mautic plus this workflow and oss.Dockerfile.
 # A tag "oss/<mautic image tag>-oss<n>" (for example oss/7.2.2-apache-oss1)
 # builds oss.Dockerfile on mautic/mautic:<mautic image tag> and pushes
-# ghcr.io/<owner>/mautic:<mautic image tag>-oss<n>.
+# ghcr.io/<owner>/mautic:<mautic image tag>-oss<n>. A pull request builds the
+# image on the newest oss/* tag's Mautic version without pushing it. Both run
+# the smoke test first.
 name: oss image
 
 on:
@@ -82,7 +84,7 @@ jobs:
           echo "checked $(git rev-list --count "$base..$HEAD_SHA") commits since $base"
 
   image:
-    if: startsWith(github.ref, 'refs/tags/oss/')
+    if: startsWith(github.ref, 'refs/tags/oss/') || github.event_name == 'pull_request'
     needs: [privacy, authors]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -97,24 +99,33 @@ jobs:
         id: v
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#oss/}"
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(apache|fpm)-oss[0-9]+$ ]] || { echo "::error::tag $GITHUB_REF_NAME isn't oss/<x.y.z>-apache|fpm-oss<n>"; exit 1; }
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            tag=$(git ls-remote --tags --refs "https://github.com/${GITHUB_REPOSITORY}.git" 'oss/*' | sed 's|.*refs/tags/||' | sort -V | tail -1)
+            version="${tag#oss/}"
+            echo "push=" >> "$GITHUB_OUTPUT"
+          else
+            version="${GITHUB_REF_NAME#oss/}"
+            echo "push=1" >> "$GITHUB_OUTPUT"
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(apache|fpm)-oss[0-9]+$ ]] || { echo "::error::$version isn't <x.y.z>-apache|fpm-oss<n>"; exit 1; }
           echo "mautic=${version%-oss*}" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/mautic:$version" >> "$GITHUB_OUTPUT"
       - name: Log in to the registry
+        if: steps.v.outputs.push == '1'
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
       - name: Already built?
         id: have
+        if: steps.v.outputs.push == '1'
         env:
           IMAGE: ${{ steps.v.outputs.image }}
         run: |
           if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
             echo "$IMAGE exists: nothing to build"; echo "exists=1" >> "$GITHUB_OUTPUT"
           fi
-      - name: Build and push
+      - name: Build
         if: steps.have.outputs.exists != '1'
         env:
           IMAGE: ${{ steps.v.outputs.image }}
@@ -135,4 +146,36 @@ jobs:
             --label org.opencontainers.image.licenses=GPL-3.0-or-later \
             -f oss.Dockerfile \
             -t "$IMAGE" "$RUNNER_TEMP/context"
-          docker push "$IMAGE"
+      # Runs the web role against MySQL: the login page loads five times with
+      # no PHP crash, and the CLI has the timezonedb extension.
+      - name: Smoke test
+        if: steps.have.outputs.exists != '1'
+        env:
+          IMAGE: ${{ steps.v.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint php "$IMAGE" -m | grep -x timezonedb
+          docker run --rm --entrypoint php "$IMAGE" -r 'echo "time zone data ", timezone_version_get(), PHP_EOL;'
+          docker network create smoke
+          docker run -d --name smoke-db --network smoke \
+            -e MYSQL_ROOT_PASSWORD=smoke -e MYSQL_DATABASE=mautic -e MYSQL_USER=mautic -e MYSQL_PASSWORD=smoke \
+            mysql:8.4
+          for i in $(seq 60); do docker exec smoke-db mysqladmin ping -uroot -psmoke --silent 2>/dev/null && break; sleep 2; done
+          docker run -d --name smoke-web --network smoke \
+            -e DOCKER_MAUTIC_ROLE=mautic_web -e MAUTIC_DB_HOST=smoke-db -e MAUTIC_DB_DATABASE=mautic \
+            -e MAUTIC_DB_USER=mautic -e MAUTIC_DB_PASSWORD=smoke \
+            "$IMAGE"
+          for i in $(seq 90); do docker logs smoke-web 2>&1 | grep -q 'resuming normal operations' && break; sleep 2; done
+          fail=
+          for i in 1 2 3 4 5; do
+            code=$(docker exec smoke-web curl -s -o /dev/null -w '%{http_code}' -L http://localhost/s/login || true)
+            echo "login page: $code"
+            [ "$code" = 200 ] || fail=1
+          done
+          if docker logs smoke-web 2>&1 | grep -q 'Segmentation fault'; then echo "::error::PHP crashed under Apache"; fail=1; fi
+          if [ -n "$fail" ]; then docker logs smoke-web 2>&1 | tail -40; exit 1; fi
+      - name: Push
+        if: steps.v.outputs.push == '1' && steps.have.outputs.exists != '1'
+        env:
+          IMAGE: ${{ steps.v.outputs.image }}
+        run: docker push "$IMAGE"
